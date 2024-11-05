@@ -21,29 +21,18 @@ function Base.append!(c::Channel{T}, vec::AbstractArray) where {T}
     Base.isbuffered(c) ? append_buffered(c, vec) : append_unbuffered(c, vec)
 end
 
-function Base.append!(c1::Channel, c2::Channel)
+function Base.append!(c1::Channel, c2::Channel{T}) where {T}
     buff_len = max(c1.sz_max, c2.sz_max)
     if buff_len == 0
         return append_unbuffered(c1, c2)
     end
 
-    buff = Vector{Any}(undef, buff_len)
+    buff = Vector{T}(undef, buff_len)
     while isopen(c2)
         take!(c2, buff_len, buff)
         append_buffered(c1, buff)
     end
     return c1
-end
-
-function append_unbuffered(c::Channel{T}, vec::AbstractArray) where {T}
-    lock(c)
-    try
-        for v in vec
-            put!(c, v)
-        end
-    finally
-        unlock(c)
-    end
 end
 
 function append_unbuffered(c1::Channel, iter)
@@ -94,25 +83,20 @@ function append_buffered(c::Channel{T}, vec::AbstractArray) where {T}
     return c
 end
 
-function Base.take!(c::Channel{T}, n::Integer; min_n=n) where {T}
-    return _take(c, n, Vector{T}(undef, n); min_n=min_n)
+function Base.take!(c::Channel{T}, n::Integer) where {T}
+    return _take(c, n, Vector{T}(undef, n))
 end
 
-function Base.take!(c::Channel{T}, n::Integer, buffer; min_n=n) where {T}
+function Base.take!(c::Channel{T}, n::Integer, buffer::AbstractArray{T2}) where {T2,T<:T2}
     # buffer is user defined, so make sure it has the correct size
     if length(buffer) != n
         resize!(buffer, n)
     end
-    return _take(c, n, buffer; min_n=min_n)
+    return _take(c, n, buffer)
 end
 
-function _take(c::Channel{T}, n::Integer, buffer; min_n=n) where {T}
+function _take(c::Channel{T}, n::Integer, buffer) where {T}
     buffered = Base.isbuffered(c)
-    # when not buffered, we lock for the minimum number of elements allowed
-    if !buffered
-        n = min_n
-    end
-
     # short-circuit for small n
     if n == 0
         return buffer
@@ -121,17 +105,17 @@ function _take(c::Channel{T}, n::Integer, buffer; min_n=n) where {T}
             return buffer
     end
 
-    buffered ? take_buffered(c, buffer, n, min_n) : take_unbuffered(c, buffer)
+    buffered ? take_buffered(c, buffer, n) : take_unbuffered(c, buffer)
 
 end
 
-function take_buffered(c::Channel{T}, res, n, min_n) where {T}
+function take_buffered(c::Channel{T}, res::AbstractArray{T2}, n::Integer) where {T2,T<:T2}
     elements_taken = 0 # number of elements taken so far
     idx1 = firstindex(res)
-    target_buffer_len = min(min_n, c.sz_max)
+    target_buffer_len = min(n, c.sz_max)
     lock(c)
     try
-        while elements_taken < min_n && (!isopen(c) && !isready(c))
+        while elements_taken < n && !(!isopen(c) && !isready(c))
             # wait until the channel has at least min_n elements or is full
             while length(c.data) < target_buffer_len && isopen(c)
                 wait(c.cond_take)
@@ -159,7 +143,7 @@ function take_buffered(c::Channel{T}, res, n, min_n) where {T}
     return res
 end
 
-function take_unbuffered(c::Channel{T}, res) where {T}
+function take_unbuffered(c::Channel{T}, res::AbstractArray{T2}) where {T2,T<:T2}
     i = firstindex(res)
     lock(c)
     try
