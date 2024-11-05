@@ -11,6 +11,48 @@ task.
     `v` now gets converted to the channel's type with [`convert`](@ref) as `put!` is called.
 """
 function Base.append!(c::Channel{T}, vec::AbstractArray) where {T}
+    # shortcircuit for small vecs
+    if length(vec) == 0
+        return c
+    elseif length(vec) == 1
+        put!(c, @inbounds vec[begin])
+        return c
+    end
+    Base.isbuffered(c) ? append_buffered(c, vec) : append_unbuffered(c, vec)
+end
+
+function Base.append!(c1::Channel, c2::Channel)
+    buff_len = max(c1.sz_max, c2.sz_max)
+    if buff_len == 0
+        return append_unbuffered(c1, c2)
+    end
+
+    buff = Vector{Any}(undef, buff_len)
+    while isopen(c2)
+        take!(c2, buff_len, buff)
+        append_buffered(c1, buff)
+    end
+    return c1
+end
+
+function append_unbuffered(c::Channel{T}, vec::AbstractArray) where {T}
+    lock(c)
+    try
+        for v in vec
+            put!(c, v)
+        end
+    finally
+        unlock(c)
+    end
+end
+
+function append_unbuffered(c1::Channel, iter)
+    for v in iter
+        put!(c1, v)
+    end
+end
+
+function append_buffered(c::Channel{T}, vec::AbstractArray) where {T}
     current_idx = firstindex(vec)
     final_idx = lastindex(vec)
     final_idx_plus_one = final_idx + 1
@@ -21,7 +63,6 @@ function Base.append!(c::Channel{T}, vec::AbstractArray) where {T}
     Base._increment_n_avail(c, elements_to_add)
     while current_idx <= final_idx
         lock(c)
-        did_buffer = false
         try
             while length(c.data) == c.sz_max
                 Base.check_channel_state(c)
@@ -37,117 +78,105 @@ function Base.append!(c::Channel{T}, vec::AbstractArray) where {T}
             # We successfully added chunk, so decrement our elements to add in case of
             # errors
             elements_to_add -= next_idx - current_idx
-            did_buffer = true
-            notify(c.cond_take, nothing, true, false)
             # notify all, since some of the waiters may be on a "fetch" call.
+            notify(c.cond_take, nothing, true, false)
             next_idx > final_idx && break
             current_idx = next_idx
         finally
             # Decrement the available items if this task had an exception before pushing the
             # item to the buffer (e.g., during `wait(c.cond_put)`):
-            did_buffer || Base._increment_n_avail(c, -elements_to_add)
+            if elements_to_add > 0
+                Base._increment_n_avail(c, -elements_to_add)
+            end
             unlock(c)
         end
     end
     return c
 end
 
+function Base.take!(c::Channel{T}, n::Integer; min_n=n) where {T}
+    return _take(c, n, Vector{T}(undef, n); min_n=min_n)
+end
 
-function take_batch!(c::Channel{T}, n) where {T}
-    if c.sz_max < n
-        throw(ArgumentError("Batch size, $n, is too large for a channel with buffer length $(c.sz_max)"))
+function Base.take!(c::Channel{T}, n::Integer, buffer; min_n=n) where {T}
+    # buffer is user defined, so make sure it has the correct size
+    if length(buffer) != n
+        resize!(buffer, n)
     end
+    return _take(c, n, buffer; min_n=min_n)
+end
+
+function _take(c::Channel{T}, n::Integer, buffer; min_n=n) where {T}
+    buffered = Base.isbuffered(c)
+    # when not buffered, we lock for the minimum number of elements allowed
+    if !buffered
+        n = min_n
+    end
+
+    # short-circuit for small n
+    if n == 0
+        return buffer
+    elseif n == 1
+        @inbounds buffer[begin] =
+            return buffer
+    end
+
+    buffered ? take_buffered(c, buffer, n, min_n) : take_unbuffered(c, buffer)
+
+end
+
+function take_buffered(c::Channel{T}, res, n, min_n) where {T}
+    elements_taken = 0 # number of elements taken so far
+    idx1 = firstindex(res)
+    target_buffer_len = min(min_n, c.sz_max)
     lock(c)
     try
-        while isempty(c.data)
-            Base.check_channel_state(c)
-            wait(c.cond_take)
+        while elements_taken < min_n && (!isopen(c) && !isready(c))
+            # wait until the channel has at least min_n elements or is full
+            while length(c.data) < target_buffer_len && isopen(c)
+                wait(c.cond_take)
+            end
+            # take as many elements as possible from the buffer
+            n_to_take = min(n - elements_taken, length(c.data))
+            idx_start = idx1 + elements_taken
+            idx_end = idx_start + n_to_take - 1
+            for (res_i, data_i) in Iterators.zip(idx_start:idx_end, eachindex(c.data))
+                @inbounds res[res_i] = c.data[data_i]
+            end
+            deleteat!(c.data, 1:n_to_take)
+            elements_taken += n_to_take
+            Base._increment_n_avail(c, -n_to_take)
+            foreach(_ -> notify(c.cond_put, nothing, true, false), 1:n_to_take)
         end
-
-        take_n = min(n, length(c.data))
-        ret = Vector{T}(undef, take_n)
-        @inbounds for i in eachindex(ret)
-            ret[i] = c.data[i]
-        end
-        foreach(_ -> popfirst!(c.data), 1:take_n)
-        Base._increment_n_avail(c, -take_n)
-        notify(c.cond_put, nothing, false, false) # notify only one, since only one slot has become available for a put!.
-        return ret
     finally
         unlock(c)
     end
+
+    # if we broke early, we need to remove the extra slots from the result
+    if elements_taken < n
+        deleteat!(res, elements_taken+1:n)
+    end
+    return res
 end
 
-function bench_basic(item_n, buffer_len)
-    items = collect(1:item_n)
-    ch = Channel{Int}(buffer_len)
-    task_n = Threads.nthreads()
-    res = Vector{Int}(undef, item_n * task_n)
-
-    for _ in 1:task_n
-        Threads.@spawn begin
-            for j in items
-                put!(ch, j)
-            end
-        end
-    end
-
-    @sync for i in Base.OneTo(task_n)
-        Threads.@spawn let offset = (i - 1) * item_n
-            for j in Base.OneTo(item_n)
-                x = take!(ch)
-                res[offset+j] = x
-            end
-        end
-    end
-    res
-end
-
-function bench_batch(item_n, buffer_len)
-    items = collect(1:item_n)
-    ch = Channel{Int}(buffer_len)
-    task_n = Threads.nthreads()
-    res = Vector{Int}(undef, item_n * task_n)
-
-    ch = Channel{Int}(buffer_len)
-    for _ in 1:task_n
-        Threads.@spawn begin
-            i = 1
-            while i <= item_n
-                append!(ch, @view items[i:min(i + buffer_len - 1, item_n)])
-                i += buffer_len
-            end
-        end
-    end
-
-    @sync for i in Base.OneTo(task_n)
-        Threads.@spawn let offset = (i - 1) * item_n
-            batch = take_batch!(ch, buffer_len)
-            batch_len = length(batch)
-            batch_i = 1
-            for j in Base.OneTo(item_n)
-                if batch_i > batch_len
-                    batch = take_batch!(ch, buffer_len)
-                    batch_i = 1
-                    batch_len = length(batch)
+function take_unbuffered(c::Channel{T}, res) where {T}
+    i = firstindex(res)
+    lock(c)
+    try
+        for i in eachindex(res)
+            @inbounds res[i] = try
+                Base.take_unbuffered(c)
+            catch e
+                if isa(e, InvalidStateException) && e.state === :closed
+                    deleteat!(res, i:lastindex(res))
+                    break
+                else
+                    rethrow()
                 end
-                x = batch[batch_i]
-                res[offset+j] = x
-                batch_i += 1
             end
         end
-
+    finally
+        unlock(c)
     end
     res
 end
-GC.gc()
-@b bench_basic(10000, 10)
-@b bench_batch(10000, 10)
-
-@b bench_basic(10000, 100)
-@b bench_batch(10000, 100)
-
-@b bench_basic(10000, 1000)
-@b bench_batch(10000, 1000)
-
-@profview_allocs bench_batch(100000, 1000)
