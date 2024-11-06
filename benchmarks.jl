@@ -1,6 +1,6 @@
 using Chairmarks: @b
 using Test
-
+includet("batch_channel_operations.jl")
 function bench_basic(item_n, buffer_len)
     items = collect(1:item_n)
     ch = Channel{Int}(buffer_len)
@@ -88,3 +88,64 @@ end
 
 Threads.@spawn append!(ch, ch2)
 take!(ch, 1000)
+
+
+@testset "append!(ch, itr)" begin
+    # buffered channel
+    c = Channel(3)
+    @test append!(c, 1:3) === c
+    @test Base.n_avail(c) == 3
+    close(c)
+    @test collect(c) == [1, 2, 3]
+    @test Base.n_avail(c) == 0
+    @test_throws InvalidStateException append!(c, 1:3)
+
+    c = Channel(3) do c
+        append!(c, 1:5)
+    end
+    @test collect(c) == [1, 2, 3, 4, 5]
+    
+    # unbuffered channel
+    c = Channel()
+    @async begin
+        append!(c, 1:3)
+        close(c)
+    end
+    wait(c)
+    @test Base.n_avail(c) == 1
+    @test collect(c) == [1, 2, 3]
+    @test Base.n_avail(c) == 0
+    @test_throws InvalidStateException append!(c, 1:3)
+
+    # appending channels
+end
+c1 = Channel(3) do c
+    append!(c, 1:5)
+end
+c2 = Channel(3)
+
+t = @async collect(c2)
+
+# this is still blocking 
+@run append!(c2, c1)
+close(c2)
+fetch(t)
+
+do c
+    append!(c, c1)
+end
+# @test collect(c2) == [1, 2, 3, 4, 5]
+
+# @testset "take!(ch, n)" begin
+    c = Channel(3)
+    append!(c, 1:3)
+    @test take!(c, 3) == [1, 2, 3]
+    @test Base.n_avail(c) == 0
+
+    @async begin
+        append!(c, 1:3)
+        close(c)
+    end
+    @test take!(c, 5) == [1, 2, 3]
+    
+end

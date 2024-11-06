@@ -28,7 +28,7 @@ function Base.append!(c1::Channel, c2::Channel{T}) where {T}
     end
 
     buff = Vector{T}(undef, buff_len)
-    while isopen(c2)
+    while isopen(c2) || isready(c2)
         take!(c2, buff_len, buff)
         append_buffered(c1, buff)
     end
@@ -71,12 +71,12 @@ function append_buffered(c::Channel{T}, vec::AbstractArray) where {T}
             notify(c.cond_take, nothing, true, false)
             next_idx > final_idx && break
             current_idx = next_idx
-        finally
+        catch
             # Decrement the available items if this task had an exception before pushing the
             # item to the buffer (e.g., during `wait(c.cond_put)`):
-            if elements_to_add > 0
-                Base._increment_n_avail(c, -elements_to_add)
-            end
+            Base._increment_n_avail(c, -elements_to_add)
+            rethrow()
+        finally
             unlock(c)
         end
     end
@@ -101,12 +101,18 @@ function _take(c::Channel{T}, n::Integer, buffer) where {T}
     if n == 0
         return buffer
     elseif n == 1
-        @inbounds buffer[begin] =
-            return buffer
+        try
+            @inbounds buffer[begin] = take!(c)
+        catch e
+            if e isa InvalidStateException && e.state === :closed
+                empty!(buffer)
+                return buffer
+            else
+                rethrow()
+            end
+        end
     end
-
     buffered ? take_buffered(c, buffer, n) : take_unbuffered(c, buffer)
-
 end
 
 function take_buffered(c::Channel{T}, res::AbstractArray{T2}, n::Integer) where {T2,T<:T2}
@@ -115,10 +121,18 @@ function take_buffered(c::Channel{T}, res::AbstractArray{T2}, n::Integer) where 
     target_buffer_len = min(n, c.sz_max)
     lock(c)
     try
-        while elements_taken < n && !(!isopen(c) && !isready(c))
+        while elements_taken < n && (isopen(c) || isready(c))
             # wait until the channel has at least min_n elements or is full
-            while length(c.data) < target_buffer_len && isopen(c)
-                wait(c.cond_take)
+            while length(c.data) < target_buffer_len && isopen(c) 
+                try
+                    wait(c.cond_take)
+                catch e
+                    if e isa InvalidStateException && e.state === :closed
+                        break
+                    else
+                        rethrow()
+                    end
+                end
             end
             # take as many elements as possible from the buffer
             n_to_take = min(n - elements_taken, length(c.data))
